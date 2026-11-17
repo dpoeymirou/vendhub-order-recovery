@@ -1,7 +1,14 @@
 import http from 'node:http';
 import pg from 'pg';
 
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL ?? 'postgres://exercise:exercise@localhost:55432/exercise' });
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL ?? 'postgres://exercise:exercise@localhost:55432/exercise',
+  // A vanished app host must not hold row locks for long: Postgres ends any
+  // transaction left idle for 10 s. A supplier call is bounded at 2 s.
+  options: '-c idle_in_transaction_session_timeout=10s'
+});
+// A dropped idle connection (for example a database restart) must not crash the app.
+pool.on('error', error => console.error(`Idle database connection lost: ${error.message}`));
 const supplierUrl = process.env.SUPPLIER_URL ?? 'http://localhost:4001';
 const port = Number(process.env.PORT ?? 3000);
 
@@ -80,21 +87,37 @@ async function recordOutcome(db: pg.Pool | pg.PoolClient, id: string, outcome: S
   }
 }
 
-// One submission attempt for a pending order. Repeating it is safe: with the same
-// key the supplier returns the original order instead of creating another.
-async function submitOrder(id: string) {
-  const order = (await pool.query('SELECT * FROM orders WHERE id = $1', [id])).rows[0];
-  if (order?.fulfillment_status !== 'pending') return;
-  const outcome = await callSupplier(order);
-  // Keep this evaluation checkpoint immediately after supplier success and
-  // before local confirmation. It simulates an unexpected process exit.
-  if (outcome.kind === 'accepted' && process.env.CRASH_AFTER_SUPPLIER_SUCCESS === '1') process.exit(91);
-  await recordOutcome(pool, id, outcome);
-  console.log(`Supplier attempt for ${id}: ${outcome.kind === 'accepted' ? `accepted ${outcome.supplierOrderId}` : `${outcome.kind}, ${outcome.error}`}`);
+// One supplier attempt for a due pending order: the given one, or the next one due.
+// Its row lock is held until the outcome is written, so another process skips the
+// order instead of calling the supplier for it at the same time. If this process
+// dies, Postgres releases the lock and the order is simply still pending.
+// Repeating an attempt is safe: with the same key the supplier returns the original order.
+async function attemptNext(onlyId: string | null = null): Promise<boolean> {
+  return inTransaction(async client => {
+    const { rows } = await client.query(
+      `SELECT * FROM orders
+       WHERE fulfillment_status = 'pending' AND next_attempt_at <= now() AND ($1::text IS NULL OR id = $1)
+       ORDER BY next_attempt_at LIMIT 1
+       FOR NO KEY UPDATE SKIP LOCKED`,
+      [onlyId]
+    );
+    const order = rows[0];
+    if (!order) return false;
+    const outcome = await callSupplier(order);
+    // Keep this evaluation checkpoint immediately after supplier success and
+    // before local confirmation. It simulates an unexpected process exit.
+    if (outcome.kind === 'accepted' && process.env.CRASH_AFTER_SUPPLIER_SUCCESS === '1') process.exit(91);
+    await recordOutcome(client, order.id, outcome);
+    console.log(`Supplier attempt for ${order.id}: ${outcome.kind === 'accepted' ? `accepted ${outcome.supplierOrderId}` : `${outcome.kind}, ${outcome.error}`}`);
+    return true;
+  });
 }
 
 async function inTransaction<T>(work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
+  // A connection lost while in use must not crash the app; the next query fails instead.
+  const onError = (error: Error) => console.error(`Database connection lost: ${error.message}`);
+  client.on('error', onError);
   try {
     await client.query('BEGIN');
     const result = await work(client);
@@ -104,6 +127,7 @@ async function inTransaction<T>(work: (client: pg.PoolClient) => Promise<T>): Pr
     await client.query('ROLLBACK').catch(() => {});
     throw error;
   } finally {
+    client.off('error', onError);
     client.release();
   }
 }
@@ -135,7 +159,22 @@ async function orderStatus(id: string) {
 // One immediate attempt so a healthy request completes quickly. The recorded
 // 'pending' state, not this attempt, is the source of truth.
 async function attemptNow(id: string) {
-  await submitOrder(id).catch(error => console.error(`Attempt for ${id} not recorded: ${String(error)}`));
+  await attemptNext(id).catch(error => console.error(`Attempt for ${id} not recorded: ${String(error)}`));
+}
+
+// Background worker, one per app process. It is only a trigger: everything it
+// needs is in the database, so any process can finish any order after a restart.
+let stopping = false;
+async function workLoop() {
+  while (!stopping) {
+    let found = false;
+    try {
+      found = await attemptNext();
+    } catch (error) {
+      console.error(`Worker attempt failed: ${String(error)}`);
+    }
+    if (!found) await new Promise(resolve => setTimeout(resolve, 500));
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -176,4 +215,10 @@ const server = http.createServer(async (req, res) => {
   } catch (error) { return json(res, 500, { error: String(error) }); }
 });
 server.listen(port, '0.0.0.0', () => console.log(`Application listening on ${port}`));
-process.on('SIGTERM', () => { server.close(); void pool.end().then(() => process.exit(0)); });
+const worker = workLoop();
+// On a stop signal, finish the current attempt, then close. A hard stop is safe too.
+process.on('SIGTERM', () => {
+  stopping = true;
+  server.close();
+  void worker.then(() => pool.end()).then(() => process.exit(0));
+});

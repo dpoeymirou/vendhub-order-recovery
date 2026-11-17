@@ -36,12 +36,26 @@ export async function setMode(ref, mode) {
   assert.ok(response.ok, `setting supplier mode ${mode} for ${ref} failed with ${response.status}`);
 }
 
-export async function confirmed(id, ms = 10000) {
+export async function reaches(id, status, ms = 10000) {
   const deadline = Date.now() + ms;
   for (;;) {
     const row = await order(id);
-    if (row.fulfillment_status === 'confirmed') return row;
-    if (Date.now() > deadline) assert.fail(`${id} not confirmed within ${ms} ms: status ${row.fulfillment_status}, last error ${row.last_error}`);
+    if (row.fulfillment_status === status) return row;
+    if (Date.now() > deadline) assert.fail(`${id} not ${status} within ${ms} ms: status ${row.fulfillment_status}, last error ${row.last_error}`);
     await new Promise(resolve => setTimeout(resolve, 100));
   }
+}
+export const confirmed = (id, ms) => reaches(id, 'confirmed', ms);
+
+// Test setup in our own database: the state a payment request leaves behind, as if
+// the app had died before trying. Only the worker can finish such an order.
+export async function markPending(id) {
+  await pool.query("UPDATE orders SET fulfillment_status = 'pending', supplier_request_key = 'vendhub-order-' || id, next_attempt_at = now() WHERE id = $1", [id]);
+}
+
+// Evidence that the worker has been running: nothing else can confirm such an order.
+export async function workerRan() {
+  const id = await newOrder('WRK');
+  await markPending(id);
+  await confirmed(id);
 }
