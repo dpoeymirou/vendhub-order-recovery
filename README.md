@@ -10,7 +10,7 @@ Every requested paid order now ends with **one supplier order** and a truthful l
 All three were reproduced before the fix, e.g. a lost reply plus a manual retry gave two supplier orders and saved the second ID.
 
 ## Approach
-1. **The database is the to-do list.** Both routes record the request in one transaction: the event (deduplicated by `event_id`) and the order marked `pending` with the key `vendhub-order-<order id>`, written once and never changed.
+1. **The database is the to-do list.** The payment route saves the event (deduplicated by `event_id`) and marks the order `pending` in one transaction; the retry route marks it `pending` in one statement. The key `vendhub-order-<order id>` is written once and never changed.
 2. **One attempt holds one row lock.** An attempt claims a due `pending` order with `FOR NO KEY UPDATE SKIP LOCKED`, calls the supplier (2 s timeout), writes the outcome and commits. Other processes skip a locked row; if the process dies, Postgres releases the lock.
 3. **Outcomes follow the contract:** 201/200 with an ID → `confirmed`; 422 → `rejected`; 503, timeout, disconnect or any other answer → still `pending`, retried with the same key after 0.5 to 2 s.
 4. **A worker in every process** polls every 500 ms; each request also makes one immediate attempt through the same claim. The crash checkpoint stays between supplier success and the confirmation write.
@@ -32,7 +32,7 @@ A payment event starts or resumes an order; an operator retry may also restart a
 ## Tests
 - **In the app container**, `npm test` (23 tests): schema and constraints, request path and retry rules, recovery from a lost reply and an outage, rejection, overlapping requests, the stable key at the supplier, and the worker (locked orders skipped, untouched and seed orders never sent).
 - **From the host**, `npm run test:system` (6 tests, about 40 s, needs only Docker and Node): two instances under overlapping requests (one supplier call and one order each), a lost reply across instances, a crash on one instance finished by the other, crash and restart without a new event, a restart during an outage, and a hard kill at a random moment in a stream of 50 notices.
-- Each test file failed on the code before its change (e.g. 5 supplier calls for one order without the lock). Supplier test controls only set up faults; results are read through `GET /orders` and the supplier's `GET /orders?order_ref=`.
+- The request-path, supplier-outcome, worker and system tests were run against the code before their change, and most failed there (e.g. 5 supplier calls for one order without the lock; no recovery without the worker); the rest cover behaviour the old code already had. Supplier test controls only set up faults; supplier state is read only through its `GET /orders?order_ref=`.
 
 ## Run
 ```bash
