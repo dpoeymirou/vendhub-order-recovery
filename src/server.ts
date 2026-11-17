@@ -42,7 +42,8 @@ async function callSupplier(order: { id: string; sku: string; quantity: number; 
     });
     const text = await response.text();
     if (response.status === 201 || response.status === 200) {
-      // 200 is a replay of our key: the supplier returns the order it already has.
+      // 200 is a replay of our key: the supplier returns the order it already has. The contract
+      // names supplier_order_id only for 201; we assume the replay uses the same field.
       const supplierOrderId = JSON.parse(text).supplier_order_id;
       if (typeof supplierOrderId === 'string' && supplierOrderId) return { kind: 'accepted', supplierOrderId };
       return { kind: 'retry', error: `Supplier answered ${response.status} without an order id, outcome unknown` };
@@ -57,9 +58,9 @@ async function callSupplier(order: { id: string; sku: string; quantity: number; 
   }
 }
 
-// Writes the outcome of one supplier call. Every write is conditional, so a late
-// or overlapping attempt can never undo a final state.
-async function recordOutcome(db: pg.Pool | pg.PoolClient, id: string, outcome: SupplierOutcome) {
+// Writes the outcome of one supplier call, inside the attempt's locked transaction.
+// Every write is conditional, so a late or overlapping attempt can never undo a final state.
+async function recordOutcome(db: pg.PoolClient, id: string, outcome: SupplierOutcome) {
   if (outcome.kind === 'accepted') {
     // The supplier holds an order under our key. That is the truth, even if an
     // earlier request for this order was rejected.
