@@ -1,5 +1,4 @@
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL ?? 'postgres://exercise:exercise@localhost:55432/exercise' });
@@ -19,35 +18,79 @@ async function body(req: http.IncomingMessage): Promise<any> {
   return JSON.parse(raw || '{}');
 }
 
-// Existing implementation. Investigate and replace or refactor as needed.
-async function submitOrder(id: string) {
-  const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
-  const order = rows[0];
-  if (!order) throw new Error('Unknown order');
-  if (order.fulfillment_status === 'confirmed') return;
+type SupplierOutcome =
+  | { kind: 'accepted'; supplierOrderId: string }
+  | { kind: 'rejected'; error: string }
+  | { kind: 'retry'; error: string };
+
+// Calls the supplier with the order's stored request key and sorts the answer the
+// way SUPPLIER_API.md defines it. Supplier problems are returned, never thrown.
+async function callSupplier(order: { id: string; sku: string; quantity: number; supplier_request_key: string }): Promise<SupplierOutcome> {
   try {
     const response = await fetch(`${supplierUrl}/orders`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'idempotency-key': randomUUID() },
+      headers: { 'content-type': 'application/json', 'idempotency-key': order.supplier_request_key },
       body: JSON.stringify({ order_ref: order.id, sku: order.sku, quantity: order.quantity }),
       signal: AbortSignal.timeout(2000)
     });
-    if (!response.ok) throw new Error(`Supplier returned ${response.status}`);
-    const result = await response.json() as { supplier_order_id: string };
-    // Keep this evaluation checkpoint immediately after supplier success and
-    // before local confirmation. It simulates an unexpected process exit.
-    if (process.env.CRASH_AFTER_SUPPLIER_SUCCESS === '1') process.exit(91);
-    await pool.query(
-      "UPDATE orders SET fulfillment_status = 'confirmed', supplier_order_id = $2, last_error = NULL, updated_at = now() WHERE id = $1",
-      [id, result.supplier_order_id]
-    );
+    const text = await response.text();
+    if (response.status === 201 || response.status === 200) {
+      // 200 is a replay of our key: the supplier returns the order it already has.
+      const supplierOrderId = JSON.parse(text).supplier_order_id;
+      if (typeof supplierOrderId === 'string' && supplierOrderId) return { kind: 'accepted', supplierOrderId };
+      return { kind: 'retry', error: `Supplier answered ${response.status} without an order id, outcome unknown` };
+    }
+    if (response.status === 422) return { kind: 'rejected', error: `Supplier rejected the order (422): ${text.slice(0, 200)}` };
+    // 503 means nothing was created; no other answer is defined as final by the contract.
+    return { kind: 'retry', error: `Supplier answered ${response.status}: ${text.slice(0, 200)}` };
   } catch (error) {
-    await pool.query(
-      "UPDATE orders SET fulfillment_status = 'failed', last_error = $2, updated_at = now() WHERE id = $1",
-      [id, String(error)]
-    );
-    throw error;
+    // Timeout or dropped connection: the supplier may or may not have the order.
+    const cause = (error as { cause?: Error }).cause?.message;
+    return { kind: 'retry', error: `No complete answer from supplier, outcome unknown: ${String(error)}${cause ? ` (${cause})` : ''}` };
   }
+}
+
+// Writes the outcome of one supplier call. Every write is conditional, so a late
+// or overlapping attempt can never undo a final state.
+async function recordOutcome(db: pg.Pool | pg.PoolClient, id: string, outcome: SupplierOutcome) {
+  if (outcome.kind === 'accepted') {
+    // The supplier holds an order under our key. That is the truth, even if an
+    // earlier request for this order was rejected.
+    await db.query(
+      `UPDATE orders SET fulfillment_status = 'confirmed', supplier_order_id = $2, last_error = NULL,
+         attempts = attempts + 1, next_attempt_at = NULL, updated_at = now()
+       WHERE id = $1 AND fulfillment_status <> 'confirmed'`,
+      [id, outcome.supplierOrderId]
+    );
+  } else if (outcome.kind === 'rejected') {
+    await db.query(
+      `UPDATE orders SET fulfillment_status = 'rejected', last_error = $2,
+         attempts = attempts + 1, next_attempt_at = NULL, updated_at = now()
+       WHERE id = $1 AND fulfillment_status = 'pending'`,
+      [id, outcome.error]
+    );
+  } else {
+    // Stay pending and wait 0.5 s longer after each unresolved attempt, at most 2 s.
+    await db.query(
+      `UPDATE orders SET last_error = $2, attempts = attempts + 1,
+         next_attempt_at = now() + LEAST(attempts + 1, 4) * interval '500 milliseconds', updated_at = now()
+       WHERE id = $1 AND fulfillment_status = 'pending'`,
+      [id, outcome.error]
+    );
+  }
+}
+
+// One submission attempt for a pending order. Repeating it is safe: with the same
+// key the supplier returns the original order instead of creating another.
+async function submitOrder(id: string) {
+  const order = (await pool.query('SELECT * FROM orders WHERE id = $1', [id])).rows[0];
+  if (order?.fulfillment_status !== 'pending') return;
+  const outcome = await callSupplier(order);
+  // Keep this evaluation checkpoint immediately after supplier success and
+  // before local confirmation. It simulates an unexpected process exit.
+  if (outcome.kind === 'accepted' && process.env.CRASH_AFTER_SUPPLIER_SUCCESS === '1') process.exit(91);
+  await recordOutcome(pool, id, outcome);
+  console.log(`Supplier attempt for ${id}: ${outcome.kind === 'accepted' ? `accepted ${outcome.supplierOrderId}` : `${outcome.kind}, ${outcome.error}`}`);
 }
 
 async function inTransaction<T>(work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
@@ -92,7 +135,7 @@ async function orderStatus(id: string) {
 // One immediate attempt so a healthy request completes quickly. The recorded
 // 'pending' state, not this attempt, is the source of truth.
 async function attemptNow(id: string) {
-  if ((await orderStatus(id)).fulfillment_status === 'pending') await submitOrder(id).catch(() => {});
+  await submitOrder(id).catch(error => console.error(`Attempt for ${id} not recorded: ${String(error)}`));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -110,9 +153,11 @@ const server = http.createServer(async (req, res) => {
       }
       if (!(await pool.query('SELECT 1 FROM orders WHERE id = $1', [input.order_id])).rowCount) return json(res, 404, { error: 'Unknown order' });
       // The notice and the submission request are recorded together, or not at all.
+      // The order row is updated first, so concurrent notices for one order wait on
+      // that row instead of risking a lock-order deadlock with the event insert.
       const isNew = await inTransaction(async client => {
-        const inserted = await client.query('INSERT INTO payment_events(event_id, order_id) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING RETURNING event_id', [input.event_id, input.order_id]);
         await requestSubmission(client, input.order_id, startableByEvent);
+        const inserted = await client.query('INSERT INTO payment_events(event_id, order_id) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING RETURNING event_id', [input.event_id, input.order_id]);
         return inserted.rowCount === 1;
       });
       await attemptNow(input.order_id);
