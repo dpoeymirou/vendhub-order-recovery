@@ -18,6 +18,10 @@ DO $$ BEGIN
     ALTER TABLE orders ADD CONSTRAINT orders_confirmed_has_supplier_id
       CHECK (fulfillment_status <> 'confirmed' OR supplier_order_id IS NOT NULL);
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_pending_has_request_key' AND conrelid = 'orders'::regclass) THEN
+    ALTER TABLE orders ADD CONSTRAINT orders_pending_has_request_key
+      CHECK (fulfillment_status <> 'pending' OR supplier_request_key IS NOT NULL);
+  END IF;
 END $$;
 -- One supplier request key per order, never shared between orders.
 CREATE UNIQUE INDEX IF NOT EXISTS orders_supplier_request_key_uq ON orders (supplier_request_key) WHERE supplier_request_key IS NOT NULL;

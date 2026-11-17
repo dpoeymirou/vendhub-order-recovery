@@ -9,7 +9,7 @@ const run = promisify(execFile);
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL ?? 'postgres://exercise:exercise@localhost:55432/exercise' });
 const setup = () => run(process.execPath, ['scripts/setup.mjs'], { env: process.env });
 const tag = randomUUID().slice(0, 8);
-const mine = [`MIG-${tag}-1`, `MIG-${tag}-2`];
+const mine = [`MIG-${tag}-1`, `MIG-${tag}-2`, `MIG-${tag}-3`];
 test.after(async () => {
   await pool.query('DELETE FROM orders WHERE id = ANY($1)', [mine]); // only this test's own rows
   await pool.end();
@@ -29,6 +29,13 @@ test('setup is safe to run several times at once and keeps existing rows', async
 test('confirmed without a supplier order id is rejected by the database', async () => {
   await assert.rejects(
     pool.query("INSERT INTO orders (id, sku, quantity, fulfillment_status) VALUES ($1, 'COFFEE-CASE', 1, 'confirmed')", [mine[1]]),
+    { code: '23514' }
+  );
+});
+
+test('pending without a supplier request key is rejected by the database', async () => {
+  await assert.rejects(
+    pool.query("INSERT INTO orders (id, sku, quantity, fulfillment_status) VALUES ($1, 'COFFEE-CASE', 1, 'pending')", [mine[2]]),
     { code: '23514' }
   );
 });
