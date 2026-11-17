@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: exercise
+      POSTGRES_PASSWORD: exercise
+      POSTGRES_DB: exercise
+    ports: ["127.0.0.1:55432:5432"]
+    volumes: ["db-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U exercise -d exercise"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  supplier:
+    image: python:3.12-slim
+    working_dir: /service
+    command: ["python", "supplier/server.py"]
+    environment:
+      SUPPLIER_DB: /data/supplier.sqlite
+    volumes:
+      - ./supplier:/service/supplier:ro
+      - supplier-data:/data
+    ports: ["127.0.0.1:4001:4001"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4001/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://exercise:exercise@db:5432/exercise
+      SUPPLIER_URL: http://supplier:4001
+      PORT: "3000"
+      CRASH_AFTER_SUPPLIER_SUCCESS: "${CRASH_AFTER_SUPPLIER_SUCCESS:-0}"
+    depends_on:
+      db: { condition: service_healthy }
+      supplier: { condition: service_healthy }
+    ports: ["127.0.0.1:3000:3000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+volumes:
+  db-data:
+  supplier-data:
