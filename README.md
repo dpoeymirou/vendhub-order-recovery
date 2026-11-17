@@ -60,7 +60,7 @@ curl 'localhost:4001/orders?order_ref=ORD-1001'   # what the supplier holds
 - Not handled: an event ID reused for another order (excluded by the contract), a hand-edited `pending` row without `next_attempt_at`, a malformed `%` in the retry URL (500).
 
 ## Time spent
-About 3.5 hours.
+About 4 hours.
 
 ## AI note
 Claude Code (Fable 5.2, Sonnet 5.5, Opus 5.5) read the contract and code, wrote the code, tests and docs, and ran the checks. I directed the work in small steps, each explained to me in plain language and executed only after my approval. Every claim had to rest on something runnable: a contract line, a reproduction on the starter, or a test shown to fail on the previous code. Corrected suggestions included recovering by looking up `order_ref` first (rejected: an empty lookup proves nothing, so recovery replays the same key) and a random-kill test that passed even without the worker (the kill landed after the burst; rewritten with a mid-stream kill).

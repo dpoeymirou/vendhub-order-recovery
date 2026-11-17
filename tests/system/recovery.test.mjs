@@ -50,13 +50,14 @@ test('first instance crashes after supplier success: the second finishes the ord
   await restartApp1({ crash: true });
   try {
     for (let tries = 0; tries < 3; tries++) {
+      // The first instance must be up, with the crash switch on, before each try.
+      if ((await app1ExitCode()) !== null) await restartApp1({ crash: true });
       const id = await newOrder();
-      await sendEvent(app1, `evt-${id}`, id).catch(() => {}); // the first instance exits mid-request
-      const outcome = await until(async () =>
-        (await app1ExitCode()) === 91 ? 'crashed'
-          : (await orderVia(app2, id))?.fulfillment_status === 'confirmed' ? 'taken by the second' : undefined,
-        `${id}: a crash or a confirmation`);
-      if (outcome !== 'crashed') continue; // the second instance happened to take it first: use a fresh order
+      // The crash happens inside this request, so the request itself fails. Docker's view of the
+      // exit can lag behind, so the request, not a state poll, tells the two cases apart.
+      const response = await sendEvent(app1, `evt-${id}`, id).catch(() => null);
+      if (response) continue; // answered: the second instance took the order before the first could, use a fresh one
+      await until(async () => (await app1ExitCode()) === 91, `${id}: the first instance to stop at the checkpoint`);
       const row = await confirmedVia(app2, id);
       assert.equal(await app1ExitCode(), 91, 'the first instance is still down');
       const atSupplier = await supplierOrders(id);
@@ -64,7 +65,7 @@ test('first instance crashes after supplier success: the second finishes the ord
       assert.equal(row.supplier_order_id, atSupplier[0].supplier_order_id);
       return;
     }
-    assert.fail('the second instance took every order before the first could crash');
+    assert.fail(`the second instance took every order before the first could crash\n${await compose(['logs', '--tail', '30', 'app', 'app2'])}`);
   } finally {
     await restartApp1();
   }
