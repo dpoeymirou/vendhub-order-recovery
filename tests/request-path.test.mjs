@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pool, unique, newOrder, post, sendEvent, retry, order, supplierOrders, confirmed } from './helpers.mjs';
+import { app, pool, unique, newOrder, post, sendEvent, retry, order, supplierOrders, confirmed } from './helpers.mjs';
 
 test.after(() => pool.end());
 
@@ -44,6 +44,20 @@ test('replayed event: reported as duplicate, no second supplier order', async ()
   assert.equal(payload.duplicate, true);
   assert.equal(payload.fulfillment_status, 'confirmed');
   assert.equal((await supplierOrders(id)).length, 1);
+});
+
+test('GET /orders keeps the basic fields and shows the submission state', async () => {
+  const id = await newOrder('REQ');
+  await sendEvent(`evt-${id}`, id);
+  await confirmed(id);
+  const row = (await (await fetch(`${app}/orders`)).json()).find(candidate => candidate.id === id);
+  for (const field of ['id', 'sku', 'quantity', 'payment_status', 'fulfillment_status', 'supplier_order_id', 'last_error',
+    'supplier_request_key', 'attempts', 'next_attempt_at']) {
+    assert.ok(field in row, `GET /orders is missing ${field}`);
+  }
+  assert.equal(row.fulfillment_status, 'confirmed');
+  assert.equal(row.supplier_request_key, `vendhub-order-${id}`);
+  assert.equal(row.supplier_order_id, (await supplierOrders(id))[0].supplier_order_id);
 });
 
 test('operator retry starts an order that was never requested', async () => {

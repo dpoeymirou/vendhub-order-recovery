@@ -27,7 +27,7 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-  app:
+  app: &app
     build: .
     environment:
       DATABASE_URL: postgres://exercise:exercise@db:5432/exercise
@@ -43,6 +43,17 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+  # Second app instance for two-instance tests: same image, database and supplier,
+  # port 3002, never the crash switch. Starts only when asked:
+  #   docker compose up -d --build --wait app2
+  app2:
+    <<: *app
+    profiles: ["two"]
+    environment:
+      DATABASE_URL: postgres://exercise:exercise@db:5432/exercise
+      SUPPLIER_URL: http://supplier:4001
+      PORT: "3000"
+    ports: ["127.0.0.1:3002:3000"]
 volumes:
   db-data:
   supplier-data:

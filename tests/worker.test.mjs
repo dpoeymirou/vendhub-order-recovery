@@ -48,6 +48,19 @@ test('an order locked by another attempt is skipped, then finished once released
   assert.equal(done.supplier_order_id, atSupplier[0].supplier_order_id);
 });
 
+test('seed orders nobody requested are never sent', async t => {
+  await workerRan();
+  // Only seeds with no payment event and no request key are untouched; demos may have used the others.
+  const { rows } = await pool.query(
+    `SELECT * FROM orders o WHERE o.id IN ('ORD-1001', 'ORD-1002') AND o.supplier_request_key IS NULL
+       AND NOT EXISTS (SELECT 1 FROM payment_events e WHERE e.order_id = o.id)`);
+  if (!rows.length) return t.skip('both seed orders have been requested on this database');
+  for (const seed of rows) {
+    assert.equal(seed.fulfillment_status, 'not_submitted');
+    assert.equal((await supplierOrders(seed.id)).length, 0, `${seed.id} reached the supplier without a request`);
+  }
+});
+
 test('an order nobody asked to submit stays not_submitted while the worker runs', async () => {
   const id = await newOrder('WRK');
   await workerRan();
